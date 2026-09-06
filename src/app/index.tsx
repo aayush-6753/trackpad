@@ -161,9 +161,7 @@ return Gesture.Simultaneous(
           <View style={styles.connectionIndicator} />
 
           <Text style={styles.gestureHint}>
-            One finger: move or left-click{"\n"}
-            Two fingers: right-click{"\n"}
-            Three fingers: disconnect
+            
           </Text>
         </View>
       </GestureDetector>
