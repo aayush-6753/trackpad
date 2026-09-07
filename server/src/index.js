@@ -1,53 +1,81 @@
 const { WebSocketServer } = require("ws");
-const { execFile } = require("node:child_process");
+const { spawn } = require("node:child_process");
 const { randomInt } = require("node:crypto");
+const path = require("node:path");
 const os = require("node:os");
 
 const PORT = 8080;
 const PIN = String(randomInt(100000, 1000000));
 
-let pendingX = 0;
-let pendingY = 0;
-let movementRunning = false;
+const allowedMessages = new Set([
+  "move",
+  "leftClick",
+  "rightClick",
+  "middleClick",
+  "leftDown",
+  "leftUp",
+  "scroll",
+  "zoom",
+  "overview",
+  "applications",
+  "exitOverview",
+  "workspaceLeft",
+  "workspaceRight",
+  "volumeUp",
+  "volumeDown",
+  "previousMedia",
+  "nextMedia",
+  "releaseAll",
+]);
 
-function clamp(value, min, max) {
-  return Math.max(min, Math.min(max, value));
-}
+const workerPath = path.join(
+  __dirname,
+  "mouse_worker.py"
+);
 
-function runYdotool(args) {
-  execFile("ydotool", args, (error) => {
-    if (error) {
-      console.error("ydotool error:", error.message);
-    }
-  });
-}
+const mouseWorker = spawn(
+  "python3",
+  ["-u", workerPath],
+  {
+    stdio: ["pipe", "pipe", "inherit"],
+  }
+);
 
-function flushMovement() {
-  if (movementRunning || (pendingX === 0 && pendingY === 0)) {
+let workerReady = false;
+
+mouseWorker.stdout.on("data", (data) => {
+  const output = data.toString().trim();
+
+  if (output) {
+    console.log(output);
+  }
+
+  if (output.includes("Mouse worker ready")) {
+    workerReady = true;
+  }
+});
+
+mouseWorker.on("error", (error) => {
+  console.error(
+    "Failed to start mouse worker:",
+    error.message
+  );
+});
+
+mouseWorker.on("exit", (code) => {
+  workerReady = false;
+  console.error(`Mouse worker stopped with code ${code}`);
+});
+
+function sendToMouse(message) {
+  if (!workerReady || !mouseWorker.stdin.writable) {
     return;
   }
 
-  const dx = clamp(Math.trunc(pendingX), -200, 200);
-  const dy = clamp(Math.trunc(pendingY), -200, 200);
-
-  pendingX -= dx;
-  pendingY -= dy;
-  movementRunning = true;
-
-  execFile(
-    "ydotool",
-    ["mousemove", "-x", String(dx), "-y", String(dy)],
-    (error) => {
-      movementRunning = false;
-
-      if (error) {
-        console.error("Mouse movement failed:", error.message);
-      }
-    }
+  mouseWorker.stdin.write(
+    `${JSON.stringify(message)}\n`
   );
 }
-
-setInterval(flushMovement, 16);
 
 const server = new WebSocketServer({
   host: "0.0.0.0",
@@ -76,46 +104,54 @@ server.on("connection", (socket, request) => {
 
   socket.on("message", (rawMessage) => {
     try {
-      const message = JSON.parse(rawMessage.toString());
+      const message = JSON.parse(
+        rawMessage.toString()
+      );
 
-      if (message.type === "move") {
-        const dx = Number(message.dx);
-        const dy = Number(message.dy);
-
-        if (!Number.isFinite(dx) || !Number.isFinite(dy)) {
-          return;
-        }
-
-        pendingX = clamp(pendingX + dx, -1000, 1000);
-        pendingY = clamp(pendingY + dy, -1000, 1000);
+      if (
+        typeof message !== "object" ||
+        message === null ||
+        !allowedMessages.has(message.type)
+      ) {
+        return;
       }
 
-      if (message.type === "leftClick") {
-        runYdotool(["click", "0xC0"]);
-      }
-
-      if (message.type === "rightClick") {
-        runYdotool(["click", "0xC1"]);
-      }
+      sendToMouse(message);
     } catch {
       console.log("Ignored invalid message");
     }
   });
 
   socket.on("close", () => {
+    sendToMouse({ type: "releaseAll" });
     console.log("Phone disconnected");
   });
 });
 
-console.log("\nWireless Trackpad Server");
-console.log(`Port: ${PORT}`);
-console.log(`PIN: ${PIN}`);
-console.log("\nLaptop addresses:");
+server.on("listening", () => {
+  console.log("\nWireless Trackpad Server");
+  console.log(`Port: ${PORT}`);
+  console.log(`PIN: ${PIN}`);
+  console.log("\nLaptop addresses:");
 
-for (const addresses of Object.values(os.networkInterfaces())) {
-  for (const address of addresses ?? []) {
-    if (address.family === "IPv4" && !address.internal) {
-      console.log(`ws://${address.address}:${PORT}?pin=${PIN}`);
+  for (const addresses of Object.values(
+    os.networkInterfaces()
+  )) {
+    for (const address of addresses ?? []) {
+      if (
+        address.family === "IPv4" &&
+        !address.internal
+      ) {
+        console.log(
+          `ws://${address.address}:${PORT}?pin=${PIN}`
+        );
+      }
     }
   }
-}
+});
+
+process.on("SIGINT", () => {
+  sendToMouse({ type: "releaseAll" });
+  mouseWorker.kill();
+  server.close(() => process.exit(0));
+});
